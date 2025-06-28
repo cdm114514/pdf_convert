@@ -12,10 +12,60 @@ use krilla::{
 };
 use anyhow::Result;
 use clap::Parser;
-use std::ops::Range;
 use rustybuzz::{Face, UnicodeBuffer};
+use lopdf::{Document as LoDoc, Dictionary, Object};
+use std::string::String;
 
-// ========== Part 1: Define Glyph, Line and clustering functions ==========
+// ========== Part 1: Inject D65 Gray Color Space ==========
+fn inject_d65gray(obj: &mut LoDoc) -> lopdf::Result<()> {
+    // 1) CalGray parameters dictionary
+    let calgray_dict = Dictionary::from_iter([
+        (b"WhitePoint".to_vec(), Object::Array(vec![
+            Object::Real(0.95047),
+            Object::Real(1.0),
+            Object::Real(1.08883),
+        ])),
+        (b"Gamma".to_vec(), Object::Real(2.2)),
+    ]);
+
+    // 2) Color space object must be an array: [/CalGray <<...>>]
+    let cs_obj = Object::Array(vec![
+        Object::Name(b"CalGray".to_vec()),
+        Object::Dictionary(calgray_dict),
+    ]);
+
+    // 3) Insert into object table and get id
+    let cs_id = obj.new_object_id();
+    obj.objects.insert(cs_id, cs_obj);
+
+    // 4) Add /d65gray reference to each page's /Resources
+    for (_, page_id) in obj.get_pages() {
+        let page = obj.get_object_mut(page_id)?.as_dict_mut()?;
+        
+        // Get or create Resources dictionary
+        let resources = if let Ok(res) = page.get_mut(b"Resources") {
+            res.as_dict_mut()?
+        } else {
+            let new_res = Dictionary::new();
+            page.set(b"Resources", Object::Dictionary(new_res));
+            page.get_mut(b"Resources")?.as_dict_mut()?
+        };
+        
+        // Get or create ColorSpace dictionary
+        let colors = if let Ok(cs) = resources.get_mut(b"ColorSpace") {
+            cs.as_dict_mut()?
+        } else {
+            let new_cs = Dictionary::new();
+            resources.set(b"ColorSpace", Object::Dictionary(new_cs));
+            resources.get_mut(b"ColorSpace")?.as_dict_mut()?
+        };
+
+        colors.set(b"d65gray".to_vec(), Object::Reference(cs_id)); // Key: must be Reference
+    }
+    Ok(())
+}
+
+// ========== Part 2: Define Glyph, Line and clustering functions ==========
 #[derive(Clone)]
 pub struct Glyph {
     pub ch: char,
@@ -53,7 +103,7 @@ fn group_lines(mut glyphs: Vec<Glyph>, _font: &Font) -> Vec<Line> {
     }).collect()
 }
 
-// ========== Part 2: Extract lines ==========
+// ========== Part 3: Extract lines ==========
 pub fn extract_lines(path: &str, font: &Font) -> Result<Vec<Vec<Line>>> {
     let pdfium = Pdfium::default();
     let doc = pdfium.load_pdf_from_file(path, None)?;
@@ -83,7 +133,7 @@ pub fn extract_lines(path: &str, font: &Font) -> Result<Vec<Vec<Line>>> {
     Ok(pages_out)
 }
 
-// ========== Part 3: Write PDF using krilla with Typst-like style ==========
+// ========== Part 4: Write PDF using krilla with Typst-like style ==========
 
 fn load_font_and_bytes() -> (Font, Vec<u8>) {
     let font_paths = [
@@ -158,29 +208,76 @@ fn draw_one_line<'a>(
     );
 }
 
+fn rewrite_content_streams(obj: &mut LoDoc) -> lopdf::Result<()> {
+    use lopdf::Object::*;
+    for (_, page_id) in obj.get_pages() {
+        let page = obj.get_object(page_id)?.as_dict()?;
+        if let Ok(contents) = page.get(b"Contents") {
+            let content_ids = match contents {
+                Reference(id) => vec![*id],
+                Array(arr) => arr.iter().filter_map(|o| o.as_reference().ok()).collect(),
+                _ => continue,
+            };
+            for cid in content_ids {
+                let stream = obj.get_object_mut(cid)?.as_stream_mut()?;
+                let decoded = stream.decompressed_content()?;
+                let content_str = std::string::String::from_utf8_lossy(&decoded);
+                // Replace color operators with proper line breaks
+                let replaced = content_str
+                    .replace("0 0 0 rg", "/d65gray cs\n0 scn")
+                    .replace("0 0 0 RG", "/d65gray CS\n0 SCN")
+                    .replace("0 Tr\n", "");
+                
+                stream.set_content(replaced.as_bytes().to_vec());
+                // Remove compression filter to avoid issues
+                stream.dict.remove(b"Filter");
+                stream.dict.remove(b"DecodeParms");
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn render_like_typst(pages: Vec<Vec<Line>>, out: &str) -> Result<()> {
     let (font, font_bytes) = load_font_and_bytes();
     let mut document = Document::new();
     for (_page_num, lines) in pages.into_iter().enumerate() {
         let mut page = document.start_page_with(PageSettings::new(595.28, 841.89));
         let mut surface = page.surface();
+
+        // Set color for the whole block
         surface.set_fill(Some(Fill {
             paint: rgb::Color::new(0, 0, 0).into(),
             opacity: NormalizedF32::ONE,
             rule: Default::default(),
         }));
-        for line in lines {
-            draw_one_line(&mut surface, &font, &font_bytes, &line);
+
+        // Draw all lines
+        for line in &lines {
+            draw_one_line(&mut surface, &font, &font_bytes, line);
         }
+
         surface.finish();
         page.finish();
     }
-    let pdf = document.finish().map_err(|e| anyhow::anyhow!("PDF generation failed: {:?}", e))?;
-    std::fs::write(out, &pdf)?;
+    
+    // Generate krilla PDF
+    let bytes = document.finish().map_err(|e| anyhow::anyhow!("PDF generation failed: {:?}", e))?;
+    
+    // Process with lopdf for color space injection and content stream rewriting
+    let mut lo = LoDoc::load_mem(&bytes)?;
+    inject_d65gray(&mut lo)?;
+    rewrite_content_streams(&mut lo)?;
+    
+    // Let lopdf rewrite the PDF with proper xref
+    let mut output = Vec::new();
+    lo.save_to(&mut output)?;
+    
+    std::fs::write(out, output)?;
     Ok(())
 }
 
-// ========== Part 4: Command line entry ==========
+// ========== Part 5: Command line entry ==========
 #[derive(Parser)]
 struct Opt {
     input: String,
