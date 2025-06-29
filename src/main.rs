@@ -4,7 +4,7 @@ use krilla::{
     Document, 
     text::{Font, KrillaGlyph, GlyphId}, 
     page::PageSettings, 
-    geom::Point, 
+    geom::{Point, Transform}, 
     paint::Fill, 
     color::rgb, 
     num::NormalizedF32, 
@@ -222,13 +222,20 @@ fn rewrite_content_streams(obj: &mut LoDoc) -> lopdf::Result<()> {
                 let stream = obj.get_object_mut(cid)?.as_stream_mut()?;
                 let decoded = stream.decompressed_content()?;
                 let content_str = std::string::String::from_utf8_lossy(&decoded);
+                
+                // Add page-level transform at the beginning (like Typst does)
+                let page_transform = "1 0 0 -1 0 841.89 cm\n";
+                
                 // Replace color operators with proper line breaks
                 let replaced = content_str
                     .replace("0 0 0 rg", "/d65gray cs\n0 scn")
                     .replace("0 0 0 RG", "/d65gray CS\n0 SCN")
                     .replace("0 Tr\n", "");
                 
-                stream.set_content(replaced.as_bytes().to_vec());
+                // Insert page transform at the beginning
+                let final_content = format!("{}{}", page_transform, replaced);
+                
+                stream.set_content(final_content.as_bytes().to_vec());
                 // Remove compression filter to avoid issues
                 stream.dict.remove(b"Filter");
                 stream.dict.remove(b"DecodeParms");
@@ -241,6 +248,7 @@ fn rewrite_content_streams(obj: &mut LoDoc) -> lopdf::Result<()> {
 pub fn render_like_typst(pages: Vec<Vec<Line>>, out: &str) -> Result<()> {
     let (font, font_bytes) = load_font_and_bytes();
     let mut document = Document::new();
+    
     for (_page_num, lines) in pages.into_iter().enumerate() {
         let mut page = document.start_page_with(PageSettings::new(595.28, 841.89));
         let mut surface = page.surface();
@@ -252,11 +260,30 @@ pub fn render_like_typst(pages: Vec<Vec<Line>>, out: &str) -> Result<()> {
             rule: Default::default(),
         }));
 
-        // Draw all lines
+        // Apply page-level transform to flip coordinate system (like Typst does)
+        // This puts the origin at top-left and flips Y-axis - should come first
+        surface.push_transform(&krilla::geom::Transform::from_row(1.0, 0.0, 0.0, -1.0, 0.0, 841.89));
+
+        // Draw all lines with proper positioning
         for line in &lines {
-            draw_one_line(&mut surface, &font, &font_bytes, line);
+            // Create a nested transform for each line (like Typst does)
+            // Use the line's x position for the transform, and y position for text matrix
+            surface.push_transform(&krilla::geom::Transform::from_row(1.0, 0.0, 0.0, 1.0, line.glyphs[0].x, 0.0));
+            
+            let (plain, kglyphs) = shape_line_with_rustybuzz(&font_bytes, line);
+            surface.draw_glyphs(
+                Point::from_xy(0.0, 841.89 - line.y),
+                &kglyphs,
+                font.clone(),
+                &plain,
+                line.size,
+                false,
+            );
+            
+            surface.pop(); // Pop the line transform
         }
 
+        surface.pop(); // Pop the page transform
         surface.finish();
         page.finish();
     }
