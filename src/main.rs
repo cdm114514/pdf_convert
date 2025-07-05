@@ -15,6 +15,7 @@ use clap::Parser;
 use rustybuzz::{Face, UnicodeBuffer};
 use lopdf::{Document as LoDoc, Dictionary, Object};
 use std::string::String;
+use regex::Regex;
 
 // ========== Part 1: Inject D65 Gray Color Space ==========
 fn inject_d65gray(obj: &mut LoDoc) -> lopdf::Result<()> {
@@ -208,9 +209,188 @@ fn draw_one_line<'a>(
     );
 }
 
+/// Extract all q ... Q blocks (assume each paragraph/line is wrapped by q ... Q)
+fn extract_q_blocks(content: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut start = None;
+    let mut depth = 0;
+    let lines: Vec<&str> = content.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        if line.trim_start().starts_with("q") {
+            if depth == 0 {
+                start = Some(i);
+            }
+            depth += 1;
+        }
+        if line.trim_start().starts_with("Q") {
+            depth -= 1;
+            if depth == 0 {
+                if let Some(s) = start {
+                    let block = lines[s..=i].join("\n");
+                    blocks.push(block);
+                }
+                start = None;
+            }
+        }
+    }
+    blocks
+}
+
+// Extract 1 0 0 1 x y cm inside a block
+fn extract_cm(lines: &[&str]) -> Option<(f32, f32, usize)> {
+    for (i, line) in lines.iter().enumerate() {
+        let parts: Vec<&str> = line.trim().split_whitespace().collect();
+        if parts.len() == 7 && parts[0] == "1" && parts[1] == "0" && parts[2] == "0" && parts[3] == "1" && parts[6] == "cm" {
+            let x = parts[4].parse().ok()?;
+            let y = parts[5].parse().ok()?;
+            return Some((x, y, i));
+        }
+    }
+    None
+}
+
+// Extract 1 0 0 -1 tx ty Tm inside a block
+fn extract_tm(lines: &[&str]) -> Option<(f32, f32, usize)> {
+    for (i, line) in lines.iter().enumerate() {
+        let parts: Vec<&str> = line.trim().split_whitespace().collect();
+        if parts.len() == 7 && parts[0] == "1" && parts[1] == "0" && parts[2] == "0" && parts[3] == "-1" && parts[6] == "Tm" {
+            let tx = parts[4].parse().ok()?;
+            let ty = parts[5].parse().ok()?;
+            return Some((tx, ty, i));
+        }
+    }
+    None
+}
+
+// Compose new Tm (outer cm + block cm + block Tm)
+fn combine_cm_tm(outer_cm: (f32, f32), block_cm: (f32, f32), block_tm: (f32, f32)) -> (f32, f32) {
+    // Note: y direction flip is handled by outer cm in typst, so we can directly add
+    (outer_cm.0 + block_cm.0 + block_tm.0, outer_cm.1 + block_cm.1 + block_tm.1)
+}
+
+/// Remove q...Q and cm, keep only content, and compose new Tm
+fn strip_q_block_with_outer_cm(block: &str, outer_cm: (f32, f32), ignore_block_cm: bool) -> String {
+    let mut lines: Vec<&str> = block.lines().collect();
+    // Remove the first line q and cm
+    if lines.len() > 2 && lines[0].trim_start().starts_with("q") && lines[2].trim_start().ends_with("cm") {
+        lines.drain(0..3);
+    } else if lines.len() > 1 && lines[0].trim_start().starts_with("q") {
+        lines.remove(0);
+    }
+    // Remove the last Q
+    if let Some(last) = lines.last() {
+        if last.trim_start().starts_with("Q") {
+            lines.pop();
+        }
+    }
+    // Extract block cm and Tm
+    let block_cm = extract_cm(&lines).unwrap_or((0.0, 0.0, usize::MAX));
+    let block_tm = extract_tm(&lines).unwrap_or((0.0, 0.0, usize::MAX));
+    // Compose new Tm
+    let new_tm = if ignore_block_cm {
+        // Reverse engineer new Tm so that outer cm + new Tm = block_cm + block_Tm
+        (block_cm.0 + block_tm.0 - outer_cm.0, block_cm.1 + block_tm.1 - outer_cm.1)
+    } else {
+        combine_cm_tm(outer_cm, (block_cm.0, block_cm.1), (block_tm.0, block_tm.1))
+    };
+    // Filter out all 1 0 0 1 ... cm and 1 0 0 -1 ... Tm lines
+    let mut filtered: Vec<String> = lines
+        .into_iter()
+        .enumerate()
+        .filter(|(i, l)| {
+            let t = l.trim_start();
+            !(t.starts_with("1 0 0 1") && t.ends_with("cm")) && !(t.starts_with("1 0 0 -1") && t.ends_with("Tm")) && *i != block_tm.2 && *i != block_cm.2
+        })
+        .map(|(_, l)| l.to_string())
+        .collect();
+    // Extract /f0 ... Tf line
+    let mut font_line = None;
+    filtered.retain(|l| {
+        if l.trim_start().starts_with("/f0") && l.trim_end().ends_with("Tf") {
+            font_line = Some(l.clone());
+            false
+        } else {
+            true
+        }
+    });
+    // Extract /d65gray cs and 0 scn lines (for body)
+    let mut color_lines = Vec::new();
+    filtered.retain(|l| {
+        let t = l.trim_start();
+        if t == "/d65gray cs" || t == "0 scn" {
+            color_lines.push(l.clone());
+            false
+        } else {
+            true
+        }
+    });
+    // Insert new Tm line (after BT), and move font line before BT
+    let mut result = Vec::new();
+    let mut bt_found = false;
+    for l in filtered {
+        if l.trim_start() == "BT" && !bt_found {
+            if let Some(font) = &font_line {
+                result.push(font.clone());
+            }
+            result.push(l);
+            result.push(format!("    1 0 0 -1 {:.5} {:.5} Tm", new_tm.0, new_tm.1));
+            bt_found = true;
+        } else {
+            result.push(l);
+        }
+    }
+    result.join("\n")
+}
+
+fn dedup_font_and_color(content: &str) -> String {
+    let mut result = Vec::new();
+    let mut last_font: Option<String> = None;
+    let mut last_color: Option<(String, String)> = None;
+    let mut font_stack = Vec::new();
+    let mut color_stack = Vec::new();
+    let mut pending_color: Option<String> = None;
+    for line in content.lines() {
+        let l = line.trim_start();
+        if l == "q" {
+            font_stack.push(last_font.clone());
+            color_stack.push(last_color.clone());
+            result.push(line.to_string());
+        } else if l == "Q" {
+            last_font = font_stack.pop().unwrap_or(None);
+            last_color = color_stack.pop().unwrap_or(None);
+            result.push(line.to_string());
+        } else if l.starts_with("/f0") && l.ends_with("Tf") {
+            if let Some(ref last) = last_font {
+                if last == l {
+                    continue; // Skip duplicate font
+                }
+            }
+            last_font = Some(l.to_string());
+            result.push(line.to_string());
+        } else if l == "/d65gray cs" || l == "0 scn" {
+            if let Some((ref last_cs, ref last_scn)) = last_color {
+                if (l == "/d65gray cs" && last_cs == l) || (l == "0 scn" && last_scn == l) {
+                    continue; // Skip duplicate color
+                }
+            }
+            // Record color pair
+            if l == "/d65gray cs" {
+                pending_color = Some(l.to_string());
+            } else if l == "0 scn" {
+                let cs = pending_color.take().unwrap_or_else(|| "/d65gray cs".to_string());
+                last_color = Some((cs, l.to_string()));
+            }
+            result.push(line.to_string());
+        } else {
+            result.push(line.to_string());
+        }
+    }
+    result.join("\n")
+}
+
 fn rewrite_content_streams(obj: &mut LoDoc) -> lopdf::Result<()> {
     use lopdf::Object::*;
-    for (_, page_id) in obj.get_pages() {
+    for (page_idx, (_, page_id)) in obj.get_pages().into_iter().enumerate() {
         let page = obj.get_object(page_id)?.as_dict()?;
         if let Ok(contents) = page.get(b"Contents") {
             let content_ids = match contents {
@@ -222,21 +402,52 @@ fn rewrite_content_streams(obj: &mut LoDoc) -> lopdf::Result<()> {
                 let stream = obj.get_object_mut(cid)?.as_stream_mut()?;
                 let decoded = stream.decompressed_content()?;
                 let content_str = std::string::String::from_utf8_lossy(&decoded);
-                
-                // Add page-level transform at the beginning (like Typst does)
-                let page_transform = "1 0 0 -1 0 841.89 cm\n";
-                
-                // Replace color operators with proper line breaks
-                let replaced = content_str
-                    .replace("0 0 0 rg", "/d65gray cs\n0 scn")
-                    .replace("0 0 0 RG", "/d65gray CS\n0 SCN")
-                    .replace("0 Tr\n", "");
-                
-                // Insert page transform at the beginning
-                let final_content = format!("{}{}", page_transform, replaced);
-                
+
+                let blocks = extract_q_blocks(&content_str);
+                let mut final_content = std::string::String::new();
+
+                if page_idx == 0 && blocks.len() >= 3 {
+                    // typst first page structure
+                    final_content.push_str("1 0 0 -1 0 841.8898 cm\nq\n    1 0 0 1 70.86614 85.03937 cm\n    q\n        1 0 0 1 137.37465 60 cm\n");
+                    final_content.push_str(&strip_q_block_with_outer_cm(&blocks[0], (70.86614+137.37465, 85.03937+60.0), true));
+                    final_content.push_str("\n    Q\n");
+                    final_content.push_str(&strip_q_block_with_outer_cm(&blocks[1], (70.86614, 85.03937), true));
+                    final_content.push_str("\n");
+                    final_content.push_str("    q\n        1 0 0 1 188.56316 110.807 cm\n");
+                    final_content.push_str(&strip_q_block_with_outer_cm(&blocks[2], (70.86614+188.56316, 85.03937+110.807), true));
+                    final_content.push_str("\n    Q\nQ\n");
+                    // Body part: only insert color and font once at the beginning
+                    for block in &blocks[3..] {
+                        let body = strip_q_block_with_outer_cm(block, (0.0, 0.0), false);
+                        final_content.push_str(&body);
+                        final_content.push_str("\n");
+                    }
+                    // Replace color
+                    final_content = final_content
+                        .replace("0 0 0 rg", "/d65gray cs\n0 scn")
+                        .replace("0 0 0 RG", "/d65gray CS\n0 SCN")
+                        .replace("0 Tr\n", "");
+                } else {
+                    // Other page body: only insert color and font once at the beginning
+                    let page_transform = "1 0 0 -1 0 841.89 cm\n";
+                    let mut page_body = std::string::String::new();
+                    let mut first = true;
+                    for block in &blocks {
+                        let block_str = strip_q_block_with_outer_cm(block, (0.0, 0.0), false);
+                        if first {
+                            page_body.push_str("/d65gray cs\n0 scn\n/F0 10 Tf\n");
+                            first = false;
+                        }
+                        page_body.push_str(&block_str);
+                        page_body.push_str("\n");
+                    }
+                    final_content = format!("{}{}", page_transform, page_body);
+                }
+
+                // Global deduplication of font and color
+                let final_content = dedup_font_and_color(&final_content);
+
                 stream.set_content(final_content.as_bytes().to_vec());
-                // Remove compression filter to avoid issues
                 stream.dict.remove(b"Filter");
                 stream.dict.remove(b"DecodeParms");
             }

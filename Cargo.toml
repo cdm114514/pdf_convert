@@ -11,3 +11,4 @@ lopdf = "*"
 anyhow = "*"
 clap = { version = "*", features = ["derive"] }
 rustybuzz = "0.10" 
+regex = "1.11.1"
