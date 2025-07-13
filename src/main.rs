@@ -509,9 +509,124 @@ pub fn render_like_typst(pages: Vec<Vec<Line>>, out: &str) -> Result<()> {
     
     // Let lopdf rewrite the PDF with proper xref
     let mut output = Vec::new();
+    // ===== typst风格结构补全 =====
+    inject_info(&mut lo)?;
+    inject_xmp(&mut lo)?;
+    inject_lang_and_labels(&mut lo, "de")?; // "de"可按需更改
+    inject_viewer_prefs(&mut lo)?;
+    inject_id(&mut lo)?;
+    // ===== typst风格结构补全结束 =====
     lo.save_to(&mut output)?;
-    
     std::fs::write(out, output)?;
+    Ok(())
+}
+
+// ===== typst风格PDF结构补全 helper函数 =====
+use lopdf::{Stream, StringFormat};
+
+fn pdf_date_now() -> String {
+    use chrono::offset::Local;
+    Local::now().format("D:%Y%m%d%H%M%S%z").to_string()
+}
+
+fn inject_info(doc: &mut lopdf::Document) -> lopdf::Result<()> {
+    let mut info = lopdf::Dictionary::new();
+    let ts = lopdf::Object::string_literal(pdf_date_now().into_bytes());
+    info.set(b"CreationDate", ts.clone());
+    info.set(b"ModDate",      ts);
+    info.set(b"Creator",      lopdf::Object::string_literal(b"Typst 0.13.1"));
+
+    let id = doc.new_object_id();
+    doc.objects.insert(id, lopdf::Object::Dictionary(info));
+    doc.trailer.set(b"Info", lopdf::Object::Reference(id));
+    Ok(())
+}
+
+fn inject_xmp(doc: &mut lopdf::Document) -> lopdf::Result<()> {
+    let xml = format!(r#"<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>
+<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+ <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+  <rdf:Description rdf:about=''
+    xmlns:pdf='http://ns.adobe.com/pdf/1.3/'
+    pdf:Producer='Typst 0.13.1'/>
+  <rdf:Description rdf:about=''
+    xmlns:xmp='http://ns.adobe.com/xap/1.0/'
+    xmp:CreatorTool='Typst 0.13.1'
+    xmp:CreateDate='{t}'
+    xmp:ModifyDate='{t}'/>
+ </rdf:RDF></x:xmpmeta><?xpacket end='w'?>"#, t = chrono::offset::Local::now().to_rfc3339());
+
+    let meta_id = doc.new_object_id();
+    let dict = lopdf::Dictionary::from_iter([
+        (b"Type".to_vec(),    lopdf::Object::Name(b"Metadata".to_vec())),
+        (b"Subtype".to_vec(), lopdf::Object::Name(b"XML".to_vec())),
+        (b"Length".to_vec(),  lopdf::Object::Integer(xml.len() as i64)),
+    ]);
+    doc.objects.insert(
+        meta_id,
+        lopdf::Object::Stream(Stream::new(dict, xml.into_bytes())),
+    );
+
+    let root_id = doc.trailer.get(b"Root")?.as_reference()?;
+    doc.get_object_mut(root_id)?.as_dict_mut()?
+        .set(b"Metadata", lopdf::Object::Reference(meta_id));
+    Ok(())
+}
+
+fn inject_lang_and_labels(doc: &mut lopdf::Document, lang: &str) -> lopdf::Result<()> {
+    use lopdf::{Dictionary, Object};
+
+    // 1. Create the /PageLabel leaf object
+    let label_leaf = Dictionary::from_iter([
+        (b"Type".to_vec(), Object::Name(b"PageLabel".to_vec())),
+        (b"S".to_vec(),    Object::Name(b"D".to_vec())), // decimal
+        (b"St".to_vec(),   Object::Integer(1)),          // start at 1
+    ]);
+    let label_leaf_id = doc.new_object_id();
+    doc.objects.insert(label_leaf_id, Object::Dictionary(label_leaf));
+
+    // 2. Compose the /PageLabels dictionary in memory (do not add to object table!)
+    let page_labels = Dictionary::from_iter([(
+        b"Nums".to_vec(),
+        Object::Array(vec![
+            Object::Integer(0),                  // page index
+            Object::Reference(label_leaf_id),    // points to the leaf object above
+        ]),
+    )]);
+
+    // 3. Attach /Lang and /PageLabels directly to the Catalog
+    let root_id = doc.trailer.get(b"Root")?.as_reference()?;
+    let root = doc.get_object_mut(root_id)?.as_dict_mut()?;
+    root.set(b"Lang", Object::string_literal(lang));
+    root.set(b"PageLabels", Object::Dictionary(page_labels));
+
+    Ok(())
+}
+
+fn inject_viewer_prefs(doc: &mut lopdf::Document) -> lopdf::Result<()> {
+    let root_id = doc.trailer.get(b"Root")?.as_reference()?;
+    let root = doc.get_object_mut(root_id)?.as_dict_mut()?;
+    root.set(
+        b"ViewerPreferences",
+        lopdf::Object::Dictionary(lopdf::Dictionary::from_iter([
+            (b"Direction".to_vec(), lopdf::Object::Name(b"L2R".to_vec())),
+        ])),
+    );
+    Ok(())
+}
+
+fn inject_id(doc: &mut lopdf::Document) -> lopdf::Result<()> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(pdf_date_now().as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = [0u8; 32];
+    base16ct::lower::encode(&digest[..16], &mut hex).unwrap();
+    let id_obj = lopdf::Object::string_literal(hex.to_vec());
+    doc.trailer.set(
+        b"ID",
+        lopdf::Object::Array(vec![id_obj.clone(), id_obj]),
+    );
     Ok(())
 }
 

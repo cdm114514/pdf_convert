@@ -12,3 +12,6 @@ anyhow = "*"
 clap = { version = "*", features = ["derive"] }
 rustybuzz = "0.10" 
 regex = "1.11.1"
+chrono = "0.4"
+base16ct = "0.2"
+sha2 = "0.10"
