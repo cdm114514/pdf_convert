@@ -303,10 +303,10 @@ fn strip_q_block_with_outer_cm(block: &str, outer_cm: (f32, f32), ignore_block_c
         })
         .map(|(_, l)| l.to_string())
         .collect();
-    // Extract /f0 ... Tf line
+    // Extract /f0 or /F0 ... Tf line
     let mut font_line = None;
     filtered.retain(|l| {
-        if l.trim_start().starts_with("/f0") && l.trim_end().ends_with("Tf") {
+        if (l.trim_start().starts_with("/f0") || l.trim_start().starts_with("/F0")) && l.trim_end().ends_with("Tf") {
             font_line = Some(l.clone());
             false
         } else {
@@ -330,7 +330,19 @@ fn strip_q_block_with_outer_cm(block: &str, outer_cm: (f32, f32), ignore_block_c
     for l in filtered {
         if l.trim_start() == "BT" && !bt_found {
             if let Some(font) = &font_line {
-                result.push(font.clone());
+                // 自动round字体大小
+                let parts: Vec<&str> = font.trim().split_whitespace().collect();
+                if parts.len() == 3 && (parts[0] == "/F0" || parts[0] == "/f0") && parts[2] == "Tf" {
+                    if let Ok(size) = parts[1].parse::<f32>() {
+                        let rounded = format!("{}", size.round() as i32);
+                        let new_font_line = format!("{} {} {}", parts[0], rounded, parts[2]);
+                        result.push(new_font_line);
+                    } else {
+                        result.push(font.clone());
+                    }
+                } else {
+                    result.push(font.clone());
+                }
             }
             result.push(l);
             result.push(format!("    1 0 0 -1 {:.5} {:.5} Tm", new_tm.0, new_tm.1));
@@ -359,7 +371,7 @@ fn dedup_font_and_color(content: &str) -> String {
             last_font = font_stack.pop().unwrap_or(None);
             last_color = color_stack.pop().unwrap_or(None);
             result.push(line.to_string());
-        } else if l.starts_with("/f0") && l.ends_with("Tf") {
+        } else if (l.starts_with("/f0") || l.starts_with("/F0")) && l.ends_with("Tf") {
             if let Some(ref last) = last_font {
                 if last == l {
                     continue; // Skip duplicate font
@@ -509,24 +521,91 @@ pub fn render_like_typst(pages: Vec<Vec<Line>>, out: &str) -> Result<()> {
     
     // Let lopdf rewrite the PDF with proper xref
     let mut output = Vec::new();
-    // ===== typst风格结构补全 =====
+    // ===== typst style structure completion =====
     inject_info(&mut lo)?;
     inject_xmp(&mut lo)?;
     inject_lang_and_labels(&mut lo, "de")?; // "de"可按需更改
     inject_viewer_prefs(&mut lo)?;
     inject_id(&mut lo)?;
-    // ===== typst风格结构补全结束 =====
+    promote_f0_to_F0(&mut lo)?; // 统一字体名称为 /F0
+    // ===== typst style structure completion end =====
     lo.save_to(&mut output)?;
     std::fs::write(out, output)?;
     Ok(())
 }
 
-// ===== typst风格PDF结构补全 helper函数 =====
+// ========== Part 5: Command line entry ==========
+#[derive(Parser)]
+struct Opt {
+    input: String,
+    output: String,
+}
+
+fn main() -> Result<()> {
+    let opt = Opt::parse();
+    let (font, _font_bytes) = load_font_and_bytes();
+    let pages = extract_lines(&opt.input, &font)?;
+    // Print extracted text for debugging
+    for (p, lines) in pages.iter().enumerate() {
+        for line in lines {
+            println!("page {:>2}  {:3.0} {:3.0}  size {:>4.1}  '{}'", 
+                     p + 1, line.glyphs[0].x, line.glyphs[0].y, line.glyphs[0].size, line.glyphs[0].ch);
+        }
+    }
+    render_like_typst(pages, &opt.output)?;
+    println!("✅ Done: {}", opt.output);
+    Ok(())
+}
+
+// ========== Part 5: Command line entry ==========
+// ========== Part 5: Command line entry ==========
 use lopdf::{Stream, StringFormat};
 
 fn pdf_date_now() -> String {
     use chrono::offset::Local;
     Local::now().format("D:%Y%m%d%H%M%S%z").to_string()
+}
+
+// ---------- Capitalization unification: promote /f0 to /F0 ----------
+fn promote_f0_to_F0(doc: &mut lopdf::Document) -> lopdf::Result<()> {
+    use lopdf::Object::*;
+
+    // ① Fix Resources/Font dictionary
+    for (_, page_id) in doc.get_pages() {
+        let page_dict = doc.get_object_mut(page_id)?.as_dict_mut()?;
+        if let Ok(resources) = page_dict.get_mut(b"Resources") {
+            if let Ok(fonts) = resources.as_dict_mut()
+                                        ?.get_mut(b"Font")
+                                        .map(|o| o.as_dict_mut()) {
+                if let Ok(fonts) = fonts {
+                    if let Some(v) = fonts.remove(b"f0") {
+                        fonts.set(b"F0", v);
+                    }
+                }
+            }
+        }
+    }
+
+    // ② Replace content streams' /f0
+    for (_, page_id) in doc.get_pages() {
+        let page = doc.get_object(page_id)?.as_dict()?;
+        if let Ok(contents) = page.get(b"Contents") {
+            let ids: Vec<_> = match contents {
+                Reference(id) => vec![*id],
+                Array(arr)    => arr.iter().filter_map(|o| o.as_reference().ok()).collect(),
+                _             => vec![],
+            };
+            for cid in ids {
+                let stream = doc.get_object_mut(cid)?.as_stream_mut()?;
+                // 直接用明文内容
+                let src = std::string::String::from_utf8_lossy(&stream.content);
+                let patched = src.replace("/f0 ", "/F0 ");
+                stream.set_content(patched.into_bytes());
+                // 不再移除Filter
+            }
+        }
+    }
+    Ok(())
 }
 
 fn inject_info(doc: &mut lopdf::Document) -> lopdf::Result<()> {
@@ -627,28 +706,5 @@ fn inject_id(doc: &mut lopdf::Document) -> lopdf::Result<()> {
         b"ID",
         lopdf::Object::Array(vec![id_obj.clone(), id_obj]),
     );
-    Ok(())
-}
-
-// ========== Part 5: Command line entry ==========
-#[derive(Parser)]
-struct Opt {
-    input: String,
-    output: String,
-}
-
-fn main() -> Result<()> {
-    let opt = Opt::parse();
-    let (font, _font_bytes) = load_font_and_bytes();
-    let pages = extract_lines(&opt.input, &font)?;
-    // Print extracted text for debugging
-    for (p, lines) in pages.iter().enumerate() {
-        for line in lines {
-            println!("page {:>2}  {:3.0} {:3.0}  size {:>4.1}  '{}'", 
-                     p + 1, line.glyphs[0].x, line.glyphs[0].y, line.glyphs[0].size, line.glyphs[0].ch);
-        }
-    }
-    render_like_typst(pages, &opt.output)?;
-    println!("✅ Done: {}", opt.output);
     Ok(())
 }
