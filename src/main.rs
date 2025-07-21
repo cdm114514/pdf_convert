@@ -39,9 +39,23 @@ fn inject_d65gray(obj: &mut LoDoc) -> lopdf::Result<()> {
     let cs_id = obj.new_object_id();
     obj.objects.insert(cs_id, cs_obj);
 
-    // 4) Add /d65gray reference to each page's /Resources
+    // 4) Add /d65gray reference to each page's /Resources and align structure with Typst
     for (_, page_id) in obj.get_pages() {
+        // Create object IDs first to avoid borrow checker issues
+        let extgstate_id = obj.new_object_id();
+        let pattern_id = obj.new_object_id();
+        let xobject_id = obj.new_object_id();
+        
+        // Insert empty dictionaries
+        obj.objects.insert(extgstate_id, Object::Dictionary(Dictionary::new()));
+        obj.objects.insert(pattern_id, Object::Dictionary(Dictionary::new()));
+        obj.objects.insert(xobject_id, Object::Dictionary(Dictionary::new()));
+        
+        // Now work with the page
         let page = obj.get_object_mut(page_id)?.as_dict_mut()?;
+        
+        // Add empty Annots array (like Typst)
+        page.set(b"Annots", Object::Array(vec![]));
         
         // Get or create Resources dictionary
         let resources = if let Ok(res) = page.get_mut(b"Resources") {
@@ -51,6 +65,9 @@ fn inject_d65gray(obj: &mut LoDoc) -> lopdf::Result<()> {
             page.set(b"Resources", Object::Dictionary(new_res));
             page.get_mut(b"Resources")?.as_dict_mut()?
         };
+        
+        // Remove ProcSet (Typst doesn't have it)
+        resources.remove(b"ProcSet");
         
         // Get or create ColorSpace dictionary
         let colors = if let Ok(cs) = resources.get_mut(b"ColorSpace") {
@@ -62,6 +79,11 @@ fn inject_d65gray(obj: &mut LoDoc) -> lopdf::Result<()> {
         };
 
         colors.set(b"d65gray".to_vec(), Object::Reference(cs_id)); // Key: must be Reference
+        
+        // Add references to empty dictionaries
+        resources.set(b"ExtGState", Object::Reference(extgstate_id));
+        resources.set(b"Pattern", Object::Reference(pattern_id));
+        resources.set(b"XObject", Object::Reference(xobject_id));
     }
     Ok(())
 }
@@ -548,8 +570,10 @@ fn main() -> Result<()> {
     // Print extracted text for debugging
     for (p, lines) in pages.iter().enumerate() {
         for line in lines {
-            println!("page {:>2}  {:3.0} {:3.0}  size {:>4.1}  '{}'", 
-                     p + 1, line.glyphs[0].x, line.glyphs[0].y, line.glyphs[0].size, line.glyphs[0].ch);
+            if !line.glyphs.is_empty() {
+                println!("page {:>2}  {:3.0} {:3.0}  size {:>4.1}  '{}'", 
+                         p + 1, line.glyphs[0].x, line.glyphs[0].y, line.glyphs[0].size, line.glyphs[0].ch);
+            }
         }
     }
     render_like_typst(pages, &opt.output)?;
@@ -557,7 +581,6 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-// ========== Part 5: Command line entry ==========
 // ========== Part 5: Command line entry ==========
 use lopdf::{Stream, StringFormat};
 
@@ -597,11 +620,22 @@ fn promote_f0_to_F0(doc: &mut lopdf::Document) -> lopdf::Result<()> {
             };
             for cid in ids {
                 let stream = doc.get_object_mut(cid)?.as_stream_mut()?;
-                // 直接用明文内容
-                let src = std::string::String::from_utf8_lossy(&stream.content);
+                
+                // Get content (either compressed or uncompressed)
+                let content = if stream.dict.get(b"Filter").is_ok() {
+                    // Content is compressed, decompress it
+                    stream.decompressed_content()?
+                } else {
+                    // Content is uncompressed, use as-is
+                    stream.content.clone()
+                };
+                
+                let src = std::string::String::from_utf8_lossy(&content);
                 let patched = src.replace("/f0 ", "/F0 ");
+                
+                // Set content and let lopdf handle compression
                 stream.set_content(patched.into_bytes());
-                // 不再移除Filter
+                stream.compress()?;
             }
         }
     }
