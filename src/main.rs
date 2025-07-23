@@ -18,7 +18,215 @@ use std::string::String;
 use regex::Regex;
 
 // ========== Part 1: Inject D65 Gray Color Space ==========
-fn inject_d65gray(obj: &mut LoDoc) -> lopdf::Result<()> {
+
+// 递归复制对象的辅助函数
+fn copy_obj_recursive(
+    src: &LoDoc, 
+    dst: &mut LoDoc, 
+    obj: &Object,
+    copied_refs: &mut std::collections::HashMap<lopdf::ObjectId, lopdf::ObjectId>
+) -> lopdf::Result<lopdf::ObjectId> {
+    use lopdf::Object::*;
+    match obj {
+        Reference(src_id) => {
+            // 如果已经复制过，直接返回新的ID
+            if let Some(&dst_id) = copied_refs.get(src_id) {
+                return Ok(dst_id);
+            }
+            
+            // 获取源对象
+            let src_obj = src.get_object(*src_id)?;
+            
+            // 分配新ID
+            let dst_id = dst.new_object_id();
+            copied_refs.insert(*src_id, dst_id);
+            
+            // 递归复制对象内容
+            let copied_obj = copy_object_content(src, dst, src_obj, copied_refs)?;
+            dst.objects.insert(dst_id, copied_obj);
+            
+            Ok(dst_id)
+        }
+        _ => {
+            // 直接对象，不是引用
+            let dst_id = dst.new_object_id();
+            let copied_obj = copy_object_content(src, dst, obj, copied_refs)?;
+            dst.objects.insert(dst_id, copied_obj);
+            Ok(dst_id)
+        }
+    }
+}
+
+// 复制对象内容并更新引用
+fn copy_object_content(
+    src: &LoDoc,
+    dst: &mut LoDoc,
+    obj: &Object,
+    copied_refs: &mut std::collections::HashMap<lopdf::ObjectId, lopdf::ObjectId>
+) -> lopdf::Result<Object> {
+    use lopdf::Object::*;
+    match obj {
+        Array(arr) => {
+            let mut new_arr = Vec::new();
+            for item in arr {
+                match item {
+                    Reference(ref_id) => {
+                        let new_id = copy_obj_recursive(src, dst, item, copied_refs)?;
+                        new_arr.push(Reference(new_id));
+                    }
+                    _ => {
+                        let copied_item = copy_object_content(src, dst, item, copied_refs)?;
+                        new_arr.push(copied_item);
+                    }
+                }
+            }
+            Ok(Array(new_arr))
+        }
+        Dictionary(dict) => {
+            let mut new_dict = lopdf::Dictionary::new();
+            for (key, value) in dict.iter() {
+                match value {
+                    Reference(ref_id) => {
+                        let new_id = copy_obj_recursive(src, dst, value, copied_refs)?;
+                        new_dict.set(key.clone(), Reference(new_id));
+                    }
+                    _ => {
+                        let copied_value = copy_object_content(src, dst, value, copied_refs)?;
+                        new_dict.set(key.clone(), copied_value);
+                    }
+                }
+            }
+            Ok(Dictionary(new_dict))
+        }
+        Stream(stream) => {
+            // 复制Stream的字典部分
+            let copied_dict = copy_object_content(src, dst, &Dictionary(stream.dict.clone()), copied_refs)?;
+            if let Dictionary(dict) = copied_dict {
+                Ok(Stream(lopdf::Stream {
+                    dict,
+                    content: stream.content.clone(),
+                    allows_compression: stream.allows_compression,
+                    start_position: None,
+                }))
+            } else {
+                Err(lopdf::Error::Syntax("Expected dictionary".to_string()))
+            }
+        }
+        _ => {
+            // 基本类型直接克隆
+            Ok(obj.clone())
+        }
+    }
+}
+
+// 从typst PDF克隆d65gray颜色空间
+fn clone_d65_from_typst(typst_path: &str, dst: &mut LoDoc) -> lopdf::Result<()> {
+    use lopdf::Object::*;
+    
+    // 加载typst PDF
+    let src = LoDoc::load(typst_path)?;
+    
+    // 1. 在typst PDF的第一页里找到/d65gray
+    let pages = src.get_pages();
+    if pages.is_empty() {
+        return Err(lopdf::Error::Syntax("No pages found".to_string()));
+    }
+    
+    let (_, page_id) = pages.into_iter().next().unwrap();
+    let page = src.get_object(page_id)?.as_dict()?;
+    
+    let resources_obj = page.get(b"Resources")?;
+    
+    // If Resources is a reference, follow it
+    let resources = match resources_obj {
+        lopdf::Object::Reference(res_id) => {
+            src.get_object(*res_id)?.as_dict()?
+        }
+        _ => resources_obj.as_dict()?
+    };
+    
+    let colorspace_obj = resources.get(b"ColorSpace")?;
+    
+    let colorspace = match colorspace_obj {
+        lopdf::Object::Reference(cs_id) => {
+            src.get_object(*cs_id)?.as_dict()?
+        }
+        _ => colorspace_obj.as_dict()?
+    };
+    
+    let d65gray_obj = colorspace.get(b"d65gray")?;
+    
+    // 2. 递归复制这个对象到目标文档
+    let mut copied_refs = std::collections::HashMap::new();
+    let new_cs_id = if let lopdf::Object::Reference(ref_id) = d65gray_obj {
+        copy_obj_recursive(&src, dst, d65gray_obj, &mut copied_refs)?
+    } else {
+        // Direct object, copy it
+        copy_obj_recursive(&src, dst, d65gray_obj, &mut copied_refs)?
+    };
+    
+    // 3. 创建与Typst相同的引用结构
+    
+    // Get the colorspace array first to avoid borrowing conflicts
+    let cs_array_opt = dst.get_object(new_cs_id).ok().cloned();
+    
+    for (_, page_id) in dst.get_pages() {
+        // Create object IDs for Resources structure (like Typst)
+        let resources_id = dst.new_object_id();
+        let colorspace_id = dst.new_object_id();
+        let extgstate_id = dst.new_object_id();
+        let pattern_id = dst.new_object_id();
+        let xobject_id = dst.new_object_id();
+        
+        // Get original page to preserve Font resources
+        let original_page = dst.get_object(page_id)?.as_dict()?;
+        let mut original_font_obj = None;
+        if let Ok(orig_resources) = original_page.get(b"Resources") {
+            if let Object::Dictionary(orig_res_dict) = orig_resources {
+                if let Ok(font_obj) = orig_res_dict.get(b"Font") {
+                    original_font_obj = Some(font_obj.clone());
+                }
+            }
+        }
+        
+        // Create ColorSpace dictionary as a separate object
+        let mut colorspace_dict = lopdf::Dictionary::new();
+        // d65gray should be the actual array [/ICCBased ref], not a reference to it
+        if let Some(ref cs_array) = cs_array_opt {
+            colorspace_dict.set(b"d65gray".to_vec(), cs_array.clone());
+        }
+        dst.objects.insert(colorspace_id, Object::Dictionary(colorspace_dict));
+        
+        // Create empty dictionaries as separate objects
+        dst.objects.insert(extgstate_id, Object::Dictionary(lopdf::Dictionary::new()));
+        dst.objects.insert(pattern_id, Object::Dictionary(lopdf::Dictionary::new()));
+        dst.objects.insert(xobject_id, Object::Dictionary(lopdf::Dictionary::new()));
+        
+        // Create Resources dictionary as a separate object
+        let mut resources_dict = lopdf::Dictionary::new();
+        resources_dict.set(b"ColorSpace", Object::Reference(colorspace_id));
+        resources_dict.set(b"ExtGState", Object::Reference(extgstate_id));
+        resources_dict.set(b"Pattern", Object::Reference(pattern_id));
+        resources_dict.set(b"XObject", Object::Reference(xobject_id));
+        
+        // Preserve Font if it existed
+        if let Some(font_obj) = original_font_obj {
+            resources_dict.set(b"Font", font_obj);
+        }
+        
+        dst.objects.insert(resources_id, Object::Dictionary(resources_dict));
+        
+        // Update page to reference the Resources object
+        let page = dst.get_object_mut(page_id)?.as_dict_mut()?;
+        page.set(b"Annots", Object::Array(vec![]));
+        page.set(b"Resources", Object::Reference(resources_id));
+    }
+    
+    Ok(())
+}
+
+// 保留原来的函数作为fallback
+fn inject_d65gray_fallback(obj: &mut LoDoc) -> lopdf::Result<()> {
     // 1) CalGray parameters dictionary
     let calgray_dict = Dictionary::from_iter([
         (b"WhitePoint".to_vec(), Object::Array(vec![
@@ -40,50 +248,60 @@ fn inject_d65gray(obj: &mut LoDoc) -> lopdf::Result<()> {
     obj.objects.insert(cs_id, cs_obj);
 
     // 4) Add /d65gray reference to each page's /Resources and align structure with Typst
+    
+    // Get the colorspace array first to avoid borrowing conflicts
+    let cs_array_opt = obj.get_object(cs_id).ok().cloned();
+    
     for (_, page_id) in obj.get_pages() {
-        // Create object IDs first to avoid borrow checker issues
+        // Create object IDs for Resources structure (like Typst)
+        let resources_id = obj.new_object_id();
+        let colorspace_id = obj.new_object_id();
         let extgstate_id = obj.new_object_id();
         let pattern_id = obj.new_object_id();
         let xobject_id = obj.new_object_id();
         
-        // Insert empty dictionaries
-        obj.objects.insert(extgstate_id, Object::Dictionary(Dictionary::new()));
-        obj.objects.insert(pattern_id, Object::Dictionary(Dictionary::new()));
-        obj.objects.insert(xobject_id, Object::Dictionary(Dictionary::new()));
+        // Get original page to preserve Font resources
+        let original_page = obj.get_object(page_id)?.as_dict()?;
+        let mut original_font_obj = None;
+        if let Ok(orig_resources) = original_page.get(b"Resources") {
+            if let Object::Dictionary(orig_res_dict) = orig_resources {
+                if let Ok(font_obj) = orig_res_dict.get(b"Font") {
+                    original_font_obj = Some(font_obj.clone());
+                }
+            }
+        }
         
-        // Now work with the page
+        // Create ColorSpace dictionary as a separate object
+        let mut colorspace_dict = lopdf::Dictionary::new();
+        // d65gray should be the actual array [/CalGray dict], not a reference to it  
+        if let Some(ref cs_array) = cs_array_opt {
+            colorspace_dict.set(b"d65gray".to_vec(), cs_array.clone());
+        }
+        obj.objects.insert(colorspace_id, Object::Dictionary(colorspace_dict));
+        
+        // Create empty dictionaries as separate objects
+        obj.objects.insert(extgstate_id, Object::Dictionary(lopdf::Dictionary::new()));
+        obj.objects.insert(pattern_id, Object::Dictionary(lopdf::Dictionary::new()));
+        obj.objects.insert(xobject_id, Object::Dictionary(lopdf::Dictionary::new()));
+        
+        // Create Resources dictionary as a separate object
+        let mut resources_dict = lopdf::Dictionary::new();
+        resources_dict.set(b"ColorSpace", Object::Reference(colorspace_id));
+        resources_dict.set(b"ExtGState", Object::Reference(extgstate_id));
+        resources_dict.set(b"Pattern", Object::Reference(pattern_id));
+        resources_dict.set(b"XObject", Object::Reference(xobject_id));
+        
+        // Preserve Font if it existed
+        if let Some(font_obj) = original_font_obj {
+            resources_dict.set(b"Font", font_obj);
+        }
+        
+        obj.objects.insert(resources_id, Object::Dictionary(resources_dict));
+        
+        // Update page to reference the Resources object
         let page = obj.get_object_mut(page_id)?.as_dict_mut()?;
-        
-        // Add empty Annots array (like Typst)
         page.set(b"Annots", Object::Array(vec![]));
-        
-        // Get or create Resources dictionary
-        let resources = if let Ok(res) = page.get_mut(b"Resources") {
-            res.as_dict_mut()?
-        } else {
-            let new_res = Dictionary::new();
-            page.set(b"Resources", Object::Dictionary(new_res));
-            page.get_mut(b"Resources")?.as_dict_mut()?
-        };
-        
-        // Remove ProcSet (Typst doesn't have it)
-        resources.remove(b"ProcSet");
-        
-        // Get or create ColorSpace dictionary
-        let colors = if let Ok(cs) = resources.get_mut(b"ColorSpace") {
-            cs.as_dict_mut()?
-        } else {
-            let new_cs = Dictionary::new();
-            resources.set(b"ColorSpace", Object::Dictionary(new_cs));
-            resources.get_mut(b"ColorSpace")?.as_dict_mut()?
-        };
-
-        colors.set(b"d65gray".to_vec(), Object::Reference(cs_id)); // Key: must be Reference
-        
-        // Add references to empty dictionaries
-        resources.set(b"ExtGState", Object::Reference(extgstate_id));
-        resources.set(b"Pattern", Object::Reference(pattern_id));
-        resources.set(b"XObject", Object::Reference(xobject_id));
+        page.set(b"Resources", Object::Reference(resources_id));
     }
     Ok(())
 }
@@ -538,7 +756,15 @@ pub fn render_like_typst(pages: Vec<Vec<Line>>, out: &str) -> Result<()> {
     
     // Process with lopdf for color space injection and content stream rewriting
     let mut lo = LoDoc::load_mem(&bytes)?;
-    inject_d65gray(&mut lo)?;
+    
+    // Try to clone d65gray from typst PDF, fallback to CalGray if failed
+    if let Err(e) = clone_d65_from_typst("typst_output.pdf", &mut lo) {
+        println!("⚠️  Failed to clone d65gray from typst PDF: {:?}, using fallback", e);
+        inject_d65gray_fallback(&mut lo)?;
+    } else {
+        println!("✅ Successfully cloned d65gray colorspace from typst PDF");
+    }
+    
     rewrite_content_streams(&mut lo)?;
     
     // Let lopdf rewrite the PDF with proper xref
@@ -596,13 +822,35 @@ fn promote_f0_to_F0(doc: &mut lopdf::Document) -> lopdf::Result<()> {
     // ① Fix Resources/Font dictionary
     for (_, page_id) in doc.get_pages() {
         let page_dict = doc.get_object_mut(page_id)?.as_dict_mut()?;
-        if let Ok(resources) = page_dict.get_mut(b"Resources") {
-            if let Ok(fonts) = resources.as_dict_mut()
-                                        ?.get_mut(b"Font")
-                                        .map(|o| o.as_dict_mut()) {
-                if let Ok(fonts) = fonts {
-                    if let Some(v) = fonts.remove(b"f0") {
-                        fonts.set(b"F0", v);
+        if let Ok(resources_obj) = page_dict.get_mut(b"Resources") {
+            // Handle both direct Resources and Reference to Resources
+            let resources_id = match resources_obj {
+                Reference(id) => *id,
+                _ => continue, // Skip if Resources is not a reference
+            };
+            
+            // Get the actual Resources dictionary
+            if let Ok(resources_dict) = doc.get_object_mut(resources_id)?.as_dict_mut() {
+                // Only process if Font exists in Resources
+                if let Ok(font_obj) = resources_dict.get(b"Font") {
+                    let font_id = match font_obj {
+                        Reference(id) => *id,
+                        _ => {
+                            // Font is a direct dictionary, handle it directly
+                            if let Ok(fonts) = resources_dict.get_mut(b"Font")?.as_dict_mut() {
+                                if let Some(v) = fonts.remove(b"f0") {
+                                    fonts.set(b"F0", v);
+                                }
+                            }
+                            continue;
+                        }
+                    };
+                    
+                    // Get the actual Font dictionary
+                    if let Ok(fonts) = doc.get_object_mut(font_id)?.as_dict_mut() {
+                        if let Some(v) = fonts.remove(b"f0") {
+                            fonts.set(b"F0", v);
+                        }
                     }
                 }
             }
