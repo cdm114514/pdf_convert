@@ -19,7 +19,7 @@ use regex::Regex;
 
 // ========== Part 1: Inject D65 Gray Color Space ==========
 
-// 递归复制对象的辅助函数
+// Helper function for recursive object copying
 fn copy_obj_recursive(
     src: &LoDoc, 
     dst: &mut LoDoc, 
@@ -29,26 +29,26 @@ fn copy_obj_recursive(
     use lopdf::Object::*;
     match obj {
         Reference(src_id) => {
-            // 如果已经复制过，直接返回新的ID
+            // If already copied, return the existing ID
             if let Some(&dst_id) = copied_refs.get(src_id) {
                 return Ok(dst_id);
             }
             
-            // 获取源对象
+            // Get source object
             let src_obj = src.get_object(*src_id)?;
             
-            // 分配新ID
+            // Allocate new ID
             let dst_id = dst.new_object_id();
             copied_refs.insert(*src_id, dst_id);
             
-            // 递归复制对象内容
+            // Recursively copy object content
             let copied_obj = copy_object_content(src, dst, src_obj, copied_refs)?;
             dst.objects.insert(dst_id, copied_obj);
             
             Ok(dst_id)
         }
         _ => {
-            // 直接对象，不是引用
+            // Direct object, not a reference
             let dst_id = dst.new_object_id();
             let copied_obj = copy_object_content(src, dst, obj, copied_refs)?;
             dst.objects.insert(dst_id, copied_obj);
@@ -57,7 +57,7 @@ fn copy_obj_recursive(
     }
 }
 
-// 复制对象内容并更新引用
+// Copy object content and update references
 fn copy_object_content(
     src: &LoDoc,
     dst: &mut LoDoc,
@@ -99,7 +99,7 @@ fn copy_object_content(
             Ok(Dictionary(new_dict))
         }
         Stream(stream) => {
-            // 复制Stream的字典部分
+            // Copy the Stream's dictionary part
             let copied_dict = copy_object_content(src, dst, &Dictionary(stream.dict.clone()), copied_refs)?;
             if let Dictionary(dict) = copied_dict {
                 Ok(Stream(lopdf::Stream {
@@ -113,20 +113,20 @@ fn copy_object_content(
             }
         }
         _ => {
-            // 基本类型直接克隆
+            // Basic types are cloned directly
             Ok(obj.clone())
         }
     }
 }
 
-// 从typst PDF克隆d65gray颜色空间
+// Clone d65gray colorspace from typst PDF
 fn clone_d65_from_typst(typst_path: &str, dst: &mut LoDoc) -> lopdf::Result<()> {
     use lopdf::Object::*;
     
-    // 加载typst PDF
+    // Load typst PDF
     let src = LoDoc::load(typst_path)?;
     
-    // 1. 在typst PDF的第一页里找到/d65gray
+    // 1. Find /d65gray in the first page of typst PDF
     let pages = src.get_pages();
     if pages.is_empty() {
         return Err(lopdf::Error::Syntax("No pages found".to_string()));
@@ -156,7 +156,7 @@ fn clone_d65_from_typst(typst_path: &str, dst: &mut LoDoc) -> lopdf::Result<()> 
     
     let d65gray_obj = colorspace.get(b"d65gray")?;
     
-    // 2. 递归复制这个对象到目标文档
+    // 2. Recursively copy this object to the target document
     let mut copied_refs = std::collections::HashMap::new();
     let new_cs_id = if let lopdf::Object::Reference(ref_id) = d65gray_obj {
         copy_obj_recursive(&src, dst, d65gray_obj, &mut copied_refs)?
@@ -165,7 +165,7 @@ fn clone_d65_from_typst(typst_path: &str, dst: &mut LoDoc) -> lopdf::Result<()> 
         copy_obj_recursive(&src, dst, d65gray_obj, &mut copied_refs)?
     };
     
-    // 3. 创建与Typst相同的引用结构
+    // 3. Create the same reference structure as Typst
     
     // Get the colorspace array first to avoid borrowing conflicts
     let cs_array_opt = dst.get_object(new_cs_id).ok().cloned();
@@ -225,7 +225,7 @@ fn clone_d65_from_typst(typst_path: &str, dst: &mut LoDoc) -> lopdf::Result<()> 
     Ok(())
 }
 
-// 保留原来的函数作为fallback
+// Keep the original function as fallback
 fn inject_d65gray_fallback(obj: &mut LoDoc) -> lopdf::Result<()> {
     // 1) CalGray parameters dictionary
     let calgray_dict = Dictionary::from_iter([
@@ -570,7 +570,7 @@ fn strip_q_block_with_outer_cm(block: &str, outer_cm: (f32, f32), ignore_block_c
     for l in filtered {
         if l.trim_start() == "BT" && !bt_found {
             if let Some(font) = &font_line {
-                // 自动round字体大小
+                // Automatically round font size
                 let parts: Vec<&str> = font.trim().split_whitespace().collect();
                 if parts.len() == 3 && (parts[0] == "/F0" || parts[0] == "/f0") && parts[2] == "Tf" {
                     if let Ok(size) = parts[1].parse::<f32>() {
@@ -772,10 +772,10 @@ pub fn render_like_typst(pages: Vec<Vec<Line>>, out: &str) -> Result<()> {
     // ===== typst style structure completion =====
     inject_info(&mut lo)?;
     inject_xmp(&mut lo)?;
-    inject_lang_and_labels(&mut lo, "de")?; // "de"可按需更改
+    inject_lang_and_labels(&mut lo, "de")?; // "de" can be changed as needed
     inject_viewer_prefs(&mut lo)?;
     inject_id(&mut lo)?;
-    promote_f0_to_F0(&mut lo)?; // 统一字体名称为 /F0
+    promote_f0_to_F0(&mut lo)?; // Unify font names to /F0
     // ===== typst style structure completion end =====
     lo.save_to(&mut output)?;
     std::fs::write(out, output)?;
