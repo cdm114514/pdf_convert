@@ -694,6 +694,12 @@ fn rewrite_content_streams(obj: &mut LoDoc) -> lopdf::Result<()> {
                         page_body.push_str("\n");
                     }
                     final_content = format!("{}{}", page_transform, page_body);
+                    
+                    // Replace color for other pages too
+                    final_content = final_content
+                        .replace("0 0 0 rg", "/d65gray cs\n0 scn")
+                        .replace("0 0 0 RG", "/d65gray CS\n0 SCN")
+                        .replace("0 Tr\n", "");
                 }
 
                 // Global deduplication of font and color
